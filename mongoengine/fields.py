@@ -13,6 +13,7 @@ from bson.int64 import Int64
 import gridfs
 import pymongo
 from pymongo import ReturnDocument
+from django.core.files.storage import default_storage
 
 try:
     import dateutil
@@ -87,7 +88,6 @@ __all__ = (
     "PolygonField",
     "SequenceField",
     "UUIDField",
-    "EnumField",
     "MultiPointField",
     "MultiLineStringField",
     "MultiPolygonField",
@@ -434,7 +434,7 @@ class DecimalField(BaseField):
         :param max_value: Validation rule for the maximum acceptable value.
         :param force_string: Store the value as a string (instead of a float).
          Be aware that this affects query sorting and operation like lte, gte (as string comparison is applied)
-         and some query operator won't work (e.g. inc, dec)
+         and some query operator won't work (e.g: inc, dec)
         :param precision: Number of decimal places to store.
         :param rounding: The rounding rule from the python decimal library:
 
@@ -774,9 +774,6 @@ class EmbeddedDocumentField(BaseField):
 
     def prepare_query_value(self, op, value):
         if value is not None and not isinstance(value, self.document_type):
-            # Short circuit for special operators, returning them as is
-            if isinstance(value, dict) and all(k.startswith("$") for k in value.keys()):
-                return value
             try:
                 value = self.document_type._from_son(value)
             except ValueError:
@@ -848,7 +845,8 @@ class DynamicField(BaseField):
     Used by :class:`~mongoengine.DynamicDocument` to handle dynamic data"""
 
     def to_mongo(self, value, use_db_field=True, fields=None):
-        """Convert a Python type to a MongoDB compatible type."""
+        """Convert a Python type to a MongoDB compatible type.
+        """
 
         if isinstance(value, str):
             return value
@@ -1622,70 +1620,6 @@ class BinaryField(BaseField):
         return super().prepare_query_value(op, self.to_mongo(value))
 
 
-class EnumField(BaseField):
-    """Enumeration Field. Values are stored underneath as is,
-    so it will only work with simple types (str, int, etc) that
-    are bson encodable
-     Example usage:
-    .. code-block:: python
-
-        class Status(Enum):
-            NEW = 'new'
-            DONE = 'done'
-
-        class ModelWithEnum(Document):
-            status = EnumField(Status, default=Status.NEW)
-
-        ModelWithEnum(status='done')
-        ModelWithEnum(status=Status.DONE)
-
-    Enum fields can be searched using enum or its value:
-    .. code-block:: python
-
-        ModelWithEnum.objects(status='new').count()
-        ModelWithEnum.objects(status=Status.NEW).count()
-
-    Note that choices cannot be set explicitly, they are derived
-    from the provided enum class.
-    """
-
-    def __init__(self, enum, **kwargs):
-        self._enum_cls = enum
-        if "choices" in kwargs:
-            raise ValueError(
-                "'choices' can't be set on EnumField, "
-                "it is implicitly set as the enum class"
-            )
-        kwargs["choices"] = list(self._enum_cls)
-        super().__init__(**kwargs)
-
-    def __set__(self, instance, value):
-        is_legal_value = value is None or isinstance(value, self._enum_cls)
-        if not is_legal_value:
-            try:
-                value = self._enum_cls(value)
-            except Exception:
-                pass
-        return super().__set__(instance, value)
-
-    def to_mongo(self, value):
-        if isinstance(value, self._enum_cls):
-            return value.value
-        return value
-
-    def validate(self, value):
-        if value and not isinstance(value, self._enum_cls):
-            try:
-                self._enum_cls(value)
-            except Exception as e:
-                self.error(str(e))
-
-    def prepare_query_value(self, op, value):
-        if value is None:
-            return value
-        return super().prepare_query_value(op, self.to_mongo(value))
-
-
 class GridFSError(Exception):
     pass
 
@@ -2105,11 +2039,104 @@ class ImageField(FileField):
             setattr(self, att_name, value)
 
         super().__init__(collection_name=collection_name, **kwargs)
+import os,sys
+def random_string(n):
+    min_lc = ord(b'a')
+    len_lc = 26
+    ba = bytearray(os.urandom(n))
+    for i, b in enumerate(ba):
+        ba[i] = min_lc + b % len_lc  # convert 0..255 to 97..122
+    return ba.decode("utf-8")
+class S3ImageField(StringField):
+    """
+        custom image field
+    """
+
+    def ___init___(
+        self, size=None, thumbnail_size=None, collection_name="images", **kwargs
+    ):
+        # if not Image:
+        #     raise ImproperlyConfigured("PIL library was not found")
+        # params_size = ("width", "height", "force")
+        # extra_args = {"size": size, "thumbnail_size": thumbnail_size}
+        # for att_name, att in extra_args.items():
+        #     value = None
+        #     if isinstance(att, (tuple, list)):
+        #         value = dict(itertools.zip_longest(params_size, att, fillvalue=None))
+        #     setattr(self, att_name, value)
+        pass
+
+    def __get__(self, instance, owner):
+        """Descriptor for retrieving a value from a field in a document.
+        """
+        if instance is None:
+            # Document class being used rather than a document object
+            return self
+
+        # Get value from document instance if available
+        return instance._data.get(self.name)
+
+    def __set__(self, instance, value):
+        """Descriptor for assigning a value to a field in a document."""
+        # If setting to None and there is a default value provided for this
+        # field, then set the value to the default value.
+        print ('SET!!!!')
+        if value is None:
+            if self.null:
+                value = None
+            elif self.default is not None:
+                value = self.default
+                if callable(value):
+                    value = value()
+
+        if instance._initialised:
+            try:
+                value_has_changed = (
+                    self.name not in instance._data
+                    or instance._data[self.name] != value
+                )
+                if value_has_changed:
+                    instance._mark_as_changed(self.name)
+            except Exception:
+                # Some values can't be compared and throw an error when we
+                # attempt to do so (e.g. tz-naive and tz-aware datetimes).
+                # Mark the field as changed in such cases.
+                instance._mark_as_changed(self.name)
+
+        EmbeddedDocument = _import_class("EmbeddedDocument")
+        if isinstance(value, EmbeddedDocument):
+            value._instance = weakref.proxy(instance)
+        elif isinstance(value, (list, tuple)):
+            for v in value:
+                if isinstance(v, EmbeddedDocument):
+                    v._instance = weakref.proxy(instance)
+
+        # ! 여기서 값을 넣어주면 될듯 한데,
+
+        print(value)
+        img = value
+        fname = 'images/{}/{}.{}'.format(instance.__class__.__name__,random_string(128),img.format.lower())
+        try:
+            buffer = BytesIO()
+            img.save(buffer, img.format)
+            buffer.seek(0)
+            default_storage.save(fname, buffer)
+            # fp = default_storage.open(fname, 'wt')
+            # img.save(fp, img.format)
+            # fp.close()
+        except Exception as E:
+            print (E)
+        instance._data[self.name] = default_storage.url(fname)
+        print(default_storage.url(fname))
+        print('SIZE SIZE')
+        print(default_storage.size(fname))
+
+
 
 
 class SequenceField(BaseField):
     """Provides a sequential counter see:
-     https://docs.mongodb.com/manual/reference/method/ObjectId/#ObjectIDs-SequenceNumbers
+     http://www.mongodb.org/display/DOCS/Object+IDs#ObjectIDs-SequenceNumbers
 
     .. note::
 
